@@ -196,6 +196,11 @@ window.submitWord = async function() {
   const word = input.value.trim().toLowerCase();
   if (!word) return;
 
+  if (!/^[a-z]+$/.test(word)) {
+    setStatus('Letters only — no numbers, spaces, or symbols!', 'error');
+    return;
+  }
+
   const chain = data.chain || [];
 
   if (chain.length > 0) {
@@ -243,14 +248,49 @@ window.submitWord = async function() {
   setStatus('');
 };
 
+// The dictionary API is built on Wiktionary, which includes slang, abbreviations,
+// foreign loanwords, and proper nouns. For 1-2 letter words we only trust a curated
+// list of genuinely common English words. For longer words, we additionally require
+// the entry to have at least one "real" part of speech — not just an abbreviation,
+// symbol, letter name, or proper noun.
+const VALID_SHORT_WORDS = new Set([
+  'a','i','ad','ah','ai','am','an','as','at','aw','ax','ay',
+  'be','by','do','eh','go','ha','he','hi','hm','if','in','is','it',
+  'ma','me','my','no','of','oh','ok','on','or','ow','ox','pa','so',
+  'to','uh','um','up','us','we','ye','yo'
+]);
+
+const BLOCKED_PARTS_OF_SPEECH = new Set([
+  'abbreviation', 'initialism', 'acronym', 'symbol', 'letter',
+  'letter name', 'proper noun', 'prefix', 'suffix', 'numeral', 'contraction'
+]);
+
 // Real dictionary lookup — works from any browser, no API key needed.
-// Fails CLOSED (rejects the word) if the lookup errors, instead of silently accepting everything.
+// Fails CLOSED (rejects the word) if the lookup errors or no acceptable
+// part of speech is found, instead of silently accepting everything.
 async function checkWordIsReal(word) {
+  if (word.length <= 2) {
+    return VALID_SHORT_WORDS.has(word);
+  }
+
+  // Guard against keyboard-mash gibberish like "aaaaa" or "asdfgh"
+  // even on the off chance such a string is ever in the dictionary.
+  if (/^(.)\1+$/.test(word)) return false; // same letter repeated
+
   try {
     const response = await fetch(`https://api.dictionaryapi.dev/api/v2/entries/en/${encodeURIComponent(word)}`);
     if (!response.ok) return false; // 404 = word not found
+
     const data = await response.json();
-    return Array.isArray(data) && data.length > 0;
+    if (!Array.isArray(data) || data.length === 0) return false;
+
+    const allPartsOfSpeech = data.flatMap(entry =>
+      (entry.meanings || []).map(m => (m.partOfSpeech || '').toLowerCase().trim())
+    );
+
+    // Accept only if at least one meaning has an acceptable part of speech.
+    const hasRealMeaning = allPartsOfSpeech.some(pos => pos && !BLOCKED_PARTS_OF_SPEECH.has(pos));
+    return hasRealMeaning;
   } catch (e) {
     setStatus('Validation service unreachable — try again', 'error');
     return false;
