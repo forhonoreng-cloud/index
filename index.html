@@ -4,6 +4,16 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Word Chain Party</title>
+<script>
+// Applied immediately (before CSS/paint) so there's no flash of the wrong
+// theme on load. Reads the saved preference from a previous visit.
+(function() {
+  try {
+    var t = localStorage.getItem('wordchain-theme') || 'dark';
+    document.documentElement.setAttribute('data-theme', t);
+  } catch (e) {}
+})();
+</script>
 <script type="module">
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
 import { getDatabase, ref, set, get, onValue, update, remove, runTransaction } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-database.js";
@@ -17,11 +27,35 @@ const db = getDatabase(app);
 // ── build tag — bump this each time you redeploy so you can confirm  ────
 // the live page is actually running the file you think it's running.
 // Check the bottom-right corner of the page after refreshing.
-const BUILD_VERSION = "v4-timer-lives";
+const BUILD_VERSION = "v5-theme-hardmode-timerfix";
 
 // ── game rules ─────────────────────────────────────────
 const TURN_SECONDS = 15;
 const MAX_LIVES = 2;
+
+// Hard-mode ("match the last 2 letters") kicks in after a random number
+// of total word entries in this range, then stays active until someone
+// loses a heart, at which point it reverts to normal and re-rolls a new
+// target in this same range. Since the range starts at 25 (well above 10),
+// there are always comfortably more than 10 normal entries before hard
+// mode can possibly trigger again.
+const HARD_MODE_MIN = 25;
+const HARD_MODE_MAX = 35;
+function rollHardModeThreshold() {
+  return HARD_MODE_MIN + Math.floor(Math.random() * (HARD_MODE_MAX - HARD_MODE_MIN + 1));
+}
+
+// ── clock sync ─────────────────────────────────────────
+// Different phones/laptops have clocks that can be several seconds off
+// from each other. If we used each device's own Date.now() to write/read
+// the shared turn timer, the countdown would look wrong on other people's
+// screens. This listens to Firebase's own server-vs-local clock offset so
+// every device computes "now" the same way.
+let serverTimeOffset = 0;
+onValue(ref(db, '.info/serverTimeOffset'), snap => {
+  serverTimeOffset = snap.val() || 0;
+});
+function nowMs() { return Date.now() + serverTimeOffset; }
 
 // ── state ──────────────────────────────────────────────
 let myName = "";
@@ -30,6 +64,19 @@ let isHost = false;
 let unsubscribe = null;
 let latestData = null;       // most recent room snapshot, used by the timer loop
 let firedTimeoutFor = null;  // dedupe key so we don't fire the same timeout twice
+
+// ── theme ──────────────────────────────────────────────
+function applyTheme(theme) {
+  document.documentElement.setAttribute('data-theme', theme);
+  const btn = document.getElementById('themeToggle');
+  if (btn) btn.textContent = theme === 'light' ? '☀️' : '🌙';
+}
+window.toggleTheme = function() {
+  const current = document.documentElement.getAttribute('data-theme') === 'light' ? 'light' : 'dark';
+  const next = current === 'light' ? 'dark' : 'light';
+  try { localStorage.setItem('wordchain-theme', next); } catch (e) {}
+  applyTheme(next);
+};
 
 // ── helpers ────────────────────────────────────────────
 function genCode() {
@@ -63,7 +110,9 @@ window.goCreate = async function() {
     currentPlayer: myName,
     turnOrder: [myName],
     currentIndex: 0,
-    turnStartTime: null
+    turnStartTime: null,
+    chainMode: 'normal',
+    modeSwitchAt: rollHardModeThreshold()
   });
   document.getElementById('roomCodeDisplay').textContent = roomCode;
   document.getElementById('shareLink').textContent = window.location.href.split('?')[0] + '?room=' + roomCode;
@@ -106,7 +155,9 @@ window.startGame = async function() {
     currentPlayer: shuffled[0],
     chain: [],
     lastWord: null,
-    turnStartTime: Date.now()
+    turnStartTime: nowMs(),
+    chainMode: 'normal',
+    modeSwitchAt: rollHardModeThreshold()
   });
 };
 
@@ -136,22 +187,33 @@ function renderLobby(data) {
 }
 
 // ── game ──────────────────────────────────────────────
+function requiredPrefixFor(data) {
+  const chain = data.chain || [];
+  if (chain.length === 0) return null;
+  const lastWord = chain[chain.length - 1];
+  const useHard = data.chainMode === 'hard' && lastWord.length >= 2;
+  return useHard ? lastWord.slice(-2).toLowerCase() : lastWord.slice(-1).toLowerCase();
+}
+
 function renderGame(data) {
   show('gameScreen');
   const chain = data.chain || [];
   const currentPlayer = data.currentPlayer;
   const players = data.players || {};
   const isMyTurn = currentPlayer === myName;
+  const isHardMode = data.chainMode === 'hard';
 
   document.getElementById('currentPlayerName').textContent = isMyTurn ? 'Your turn! 🎯' : `${currentPlayer}'s turn`;
-  document.getElementById('currentPlayerName').style.color = isMyTurn ? 'var(--accent)' : 'var(--text)';
+  document.getElementById('currentPlayerName').style.color = isMyTurn ? 'var(--accent-text)' : 'var(--text)';
+
+  const hardBanner = document.getElementById('hardModeBanner');
+  if (hardBanner) hardBanner.style.display = isHardMode ? 'block' : 'none';
 
   const mustDiv = document.getElementById('mustStartDiv');
-  if (chain.length > 0) {
-    const lastWord = chain[chain.length - 1];
-    const letter = lastWord.slice(-1).toUpperCase();
+  const required = requiredPrefixFor(data);
+  if (required) {
     mustDiv.style.display = 'block';
-    document.getElementById('mustStartLetter').textContent = letter;
+    document.getElementById('mustStartLetter').textContent = required.toUpperCase();
   } else {
     mustDiv.style.display = 'none';
   }
@@ -203,11 +265,10 @@ function renderGame(data) {
     `;
   }).join('');
 
-  // reset the per-turn timeout guard whenever the turn itself changes
   updateTimerDisplay();
 }
 
-// ── countdown timer (client-driven, transaction-safe) ─────────────────
+// ── countdown timer (synced clock, transaction-safe) ───────────────────
 function updateTimerDisplay() {
   const wrap = document.getElementById('timerWrap');
   if (!latestData || latestData.status !== 'playing' || !latestData.turnStartTime) {
@@ -215,7 +276,7 @@ function updateTimerDisplay() {
     return;
   }
   if (wrap) wrap.style.display = 'flex';
-  const elapsed = Date.now() - latestData.turnStartTime;
+  const elapsed = nowMs() - latestData.turnStartTime;
   const remainingMs = Math.max(0, TURN_SECONDS * 1000 - elapsed);
   const remainingSec = Math.ceil(remainingMs / 1000);
   const pct = Math.max(0, Math.min(100, (remainingMs / (TURN_SECONDS * 1000)) * 100));
@@ -240,7 +301,7 @@ setInterval(() => {
 function checkForTimeout() {
   if (!latestData || latestData.status !== 'playing' || !latestData.turnStartTime) return;
   if (!roomCode) return;
-  const elapsed = Date.now() - latestData.turnStartTime;
+  const elapsed = nowMs() - latestData.turnStartTime;
   if (elapsed < TURN_SECONDS * 1000) return;
 
   const key = latestData.currentPlayer + '-' + latestData.turnStartTime;
@@ -273,6 +334,12 @@ async function attemptTimeout(expectedPlayer, expectedStart) {
         p === expectedPlayer ? stillAlive : (players[p] || {}).alive !== false
       );
 
+      // Losing a heart always knocks the chain back to normal mode and
+      // re-rolls a fresh random target for the next hard-mode trigger.
+      const totalWords = (room.chain || []).length;
+      room.chainMode = 'normal';
+      room.modeSwitchAt = totalWords + rollHardModeThreshold();
+
       if (aliveList.length <= 1) {
         room.players = players;
         room.status = 'finished';
@@ -290,7 +357,7 @@ async function attemptTimeout(expectedPlayer, expectedStart) {
 
       room.players = players;
       room.currentPlayer = nextPlayer;
-      room.turnStartTime = Date.now();
+      room.turnStartTime = nowMs();
       return room;
     });
   } catch (e) {
@@ -316,13 +383,10 @@ window.submitWord = async function() {
   }
 
   const chain = data.chain || [];
-  if (chain.length > 0) {
-    const lastWord = chain[chain.length - 1];
-    const required = lastWord.slice(-1).toLowerCase();
-    if (word[0] !== required) {
-      setStatus(`Must start with "${required.toUpperCase()}"!`, 'error');
-      return;
-    }
+  const required = requiredPrefixFor(data);
+  if (required && !word.startsWith(required)) {
+    setStatus(`Must start with "${required.toUpperCase()}"!`, 'error');
+    return;
   }
 
   if (chain.map(w => w.toLowerCase()).includes(word)) {
@@ -360,10 +424,20 @@ window.submitWord = async function() {
   const nextIdx = (curIdx + 1) % alivePlayers.length;
   const nextPlayer = alivePlayers[nextIdx];
 
+  // Flip into hard mode once the random threshold is crossed. Only ever
+  // flips normal -> hard here; hard -> normal only happens on a heart loss.
+  let chainMode = freshData.chainMode || 'normal';
+  const modeSwitchAt = freshData.modeSwitchAt ?? rollHardModeThreshold();
+  if (chainMode === 'normal' && newChain.length >= modeSwitchAt) {
+    chainMode = 'hard';
+  }
+
   await update(roomRef(roomCode), {
     chain: newChain,
     currentPlayer: nextPlayer,
-    turnStartTime: Date.now(),
+    turnStartTime: nowMs(),
+    chainMode: chainMode,
+    modeSwitchAt: modeSwitchAt,
     [`players/${myName}/score`]: (freshData.players[myName]?.score || 0) + 1
   });
 
@@ -440,12 +514,17 @@ window.eliminatePlayer = async function() {
     return (players[p] || {}).alive !== false;
   });
 
+  // Manual elimination also counts as "losing a heart" for hard-mode purposes.
+  const totalWords = (data.chain || []).length;
+  const resetMode = { chainMode: 'normal', modeSwitchAt: totalWords + rollHardModeThreshold() };
+
   if (remaining.length === 1) {
     await update(roomRef(roomCode), {
       status: 'finished',
       winner: remaining[0],
       [`players/${currentPlayer}/alive`]: false,
-      [`players/${currentPlayer}/lives`]: 0
+      [`players/${currentPlayer}/lives`]: 0,
+      ...resetMode
     });
     return;
   }
@@ -464,7 +543,8 @@ window.eliminatePlayer = async function() {
     [`players/${currentPlayer}/alive`]: false,
     [`players/${currentPlayer}/lives`]: 0,
     currentPlayer: nextPlayer,
-    turnStartTime: Date.now()
+    turnStartTime: nowMs(),
+    ...resetMode
   });
 };
 
@@ -491,20 +571,36 @@ window.addEventListener('load', () => {
   });
   const vTag = document.getElementById('buildVersion');
   if (vTag) vTag.textContent = BUILD_VERSION;
+
+  const currentTheme = document.documentElement.getAttribute('data-theme') === 'light' ? 'light' : 'dark';
+  applyTheme(currentTheme);
 });
 </script>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Syne:wght@700;800&family=Inter:wght@400;500;600&display=swap');
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
 :root {
   --bg: #0d0d0d;
   --card: #161616;
   --border: #2a2a2a;
   --accent: #c8f135;
+  --accent-text: #c8f135;
   --text: #f0f0f0;
   --muted: #777;
   --danger: #ff3b3b;
 }
+:root[data-theme="light"] {
+  --bg: #f6f5f0;
+  --card: #ffffff;
+  --border: #e1ded4;
+  --accent: #c8f135;
+  --accent-text: #5c8a00;
+  --text: #1a1a1a;
+  --muted: #6e6e68;
+  --danger: #d6291f;
+}
+
 body {
   background: var(--bg);
   color: var(--text);
@@ -514,7 +610,29 @@ body {
   flex-direction: column;
   align-items: center;
   padding: 28px 16px 60px;
+  transition: background 0.25s, color 0.25s;
 }
+
+.theme-toggle {
+  position: fixed;
+  top: 14px;
+  right: 14px;
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  background: var(--card);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-size: 1.05rem;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 50;
+  transition: transform 0.15s, background 0.25s;
+}
+.theme-toggle:active { transform: scale(0.92); }
+
 h1 {
   font-family: 'Syne', sans-serif;
   font-size: clamp(2rem, 9vw, 3.2rem);
@@ -524,7 +642,7 @@ h1 {
   margin-bottom: 4px;
   text-align: center;
 }
-h1 span { color: var(--accent); }
+h1 span { color: var(--accent-text); }
 .tagline { color: var(--muted); font-size: 0.9rem; margin-bottom: 32px; text-align: center; }
 .screen {
   display: none;
@@ -539,6 +657,7 @@ h1 span { color: var(--accent); }
   padding: 24px;
   width: 100%;
   max-width: 480px;
+  transition: background 0.25s, border-color 0.25s;
 }
 .section-label {
   font-size: 0.68rem;
@@ -549,7 +668,7 @@ h1 span { color: var(--accent); }
   margin-bottom: 12px;
 }
 input[type="text"] {
-  background: #1e1e1e;
+  background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 10px;
   color: var(--text);
@@ -558,10 +677,10 @@ input[type="text"] {
   padding: 12px 16px;
   width: 100%;
   outline: none;
-  transition: border-color 0.2s;
+  transition: border-color 0.2s, background 0.25s, color 0.25s;
   margin-bottom: 10px;
 }
-input[type="text"]:focus { border-color: var(--accent); }
+input[type="text"]:focus { border-color: var(--accent-text); }
 input[type="text"]::placeholder { color: var(--muted); }
 input[type="text"]:disabled { opacity: 0.4; cursor: not-allowed; }
 .row { display: flex; gap: 8px; }
@@ -588,7 +707,7 @@ input[type="text"]:disabled { opacity: 0.4; cursor: not-allowed; }
   font-family: 'Syne', sans-serif;
   font-size: 3rem;
   font-weight: 800;
-  color: var(--accent);
+  color: var(--accent-text);
   letter-spacing: 6px;
   text-align: center;
   margin: 8px 0 4px;
@@ -601,9 +720,9 @@ input[type="text"]:disabled { opacity: 0.4; cursor: not-allowed; }
   margin-bottom: 16px;
   cursor: pointer;
 }
-.share-link:hover { color: var(--accent); }
+.share-link:hover { color: var(--accent-text); }
 .player-tag {
-  background: #1e1e1e;
+  background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 10px;
   padding: 10px 14px;
@@ -621,7 +740,20 @@ input[type="text"]:disabled { opacity: 0.4; cursor: not-allowed; }
   transition: color 0.3s;
 }
 .must-start { margin-top: 8px; font-size: 0.85rem; color: var(--muted); }
-.must-start strong { font-family: 'Syne', sans-serif; font-size: 2rem; color: var(--text); display: block; margin-top: 2px; }
+.must-start strong { font-family: 'Syne', sans-serif; font-size: 2rem; color: var(--text); display: block; margin-top: 2px; letter-spacing: 2px; }
+
+/* ── hard mode banner ───────────────────────────────── */
+.hard-mode-banner {
+  background: rgba(214, 41, 31, 0.12);
+  border: 1px solid var(--danger);
+  color: var(--danger);
+  border-radius: 10px;
+  padding: 8px 12px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  text-align: center;
+  margin-bottom: 14px;
+}
 
 /* ── timer bar ───────────────────────────────────── */
 .timer-wrap {
@@ -633,7 +765,7 @@ input[type="text"]:disabled { opacity: 0.4; cursor: not-allowed; }
 .timer-track {
   flex: 1;
   height: 8px;
-  background: #1e1e1e;
+  background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 6px;
   overflow: hidden;
@@ -654,7 +786,7 @@ input[type="text"]:disabled { opacity: 0.4; cursor: not-allowed; }
 }
 
 .chain-box {
-  background: #111;
+  background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 12px;
   padding: 12px 14px;
@@ -666,27 +798,27 @@ input[type="text"]:disabled { opacity: 0.4; cursor: not-allowed; }
   align-items: center;
   overflow-x: auto;
 }
-.chain-word { background: #222; border-radius: 6px; padding: 4px 10px; font-size: 0.82rem; color: var(--muted); }
-.chain-word.latest { background: var(--accent); color: #000; font-weight: 600; }
+.chain-word { background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 4px 10px; font-size: 0.82rem; color: var(--muted); }
+.chain-word.latest { background: var(--accent); border-color: var(--accent); color: #000; font-weight: 600; }
 .chain-empty { color: var(--muted); font-size: 0.82rem; font-style: italic; }
 .status-msg { text-align: center; font-size: 0.88rem; min-height: 20px; margin-bottom: 12px; font-weight: 500; }
 .status-msg.error { color: var(--danger); }
-.status-msg.success { color: var(--accent); }
+.status-msg.success { color: var(--accent-text); }
 .status-msg.checking { color: var(--muted); }
 .player-score-row { display: flex; align-items: center; justify-content: space-between; padding: 9px 0; border-bottom: 1px solid var(--border); font-size: 0.88rem; gap: 8px; }
 .player-score-row:last-child { border-bottom: none; }
 .player-score-row .name { font-weight: 500; flex: 1; }
 .player-score-row .lives { font-size: 0.8rem; letter-spacing: 1px; white-space: nowrap; }
-.player-score-row .score { font-family: 'Syne', sans-serif; font-size: 1.05rem; color: var(--accent); min-width: 22px; text-align: right; }
+.player-score-row .score { font-family: 'Syne', sans-serif; font-size: 1.05rem; color: var(--accent-text); min-width: 22px; text-align: right; }
 .player-score-row.eliminated .name { text-decoration: line-through; color: var(--muted); }
 .player-score-row.eliminated .score { color: var(--muted); }
 .badge-elim { font-size: 0.6rem; background: var(--danger); color: #fff; border-radius: 4px; padding: 2px 5px; font-weight: 600; letter-spacing: 0.05em; margin-left: 6px; }
 .badge-active { font-size: 0.6rem; background: var(--accent); color: #000; border-radius: 4px; padding: 2px 5px; font-weight: 600; letter-spacing: 0.05em; margin-left: 6px; }
 #winnerScreen { text-align: center; }
 .winner-emoji { font-size: 4rem; margin-bottom: 14px; }
-.winner-name { font-family: 'Syne', sans-serif; font-size: 2.4rem; font-weight: 800; color: var(--accent); margin-bottom: 6px; }
+.winner-name { font-family: 'Syne', sans-serif; font-size: 2.4rem; font-weight: 800; color: var(--accent-text); margin-bottom: 6px; }
 .winner-sub { color: var(--muted); margin-bottom: 24px; }
-.spinner { display: inline-block; width: 12px; height: 12px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.6s linear infinite; vertical-align: middle; margin-right: 5px; }
+.spinner { display: inline-block; width: 12px; height: 12px; border: 2px solid var(--border); border-top-color: var(--accent-text); border-radius: 50%; animation: spin 0.6s linear infinite; vertical-align: middle; margin-right: 5px; }
 @keyframes spin { to { transform: rotate(360deg); } }
 .copy-hint { font-size: 0.72rem; color: var(--muted); text-align: center; margin-top: 4px; }
 .build-tag {
@@ -701,6 +833,8 @@ input[type="text"]:disabled { opacity: 0.4; cursor: not-allowed; }
 </style>
 </head>
 <body>
+<button class="theme-toggle" id="themeToggle" onclick="toggleTheme()" aria-label="Toggle light or dark mode">🌙</button>
+
 <h1>Word <span>Chain</span></h1>
 <p class="tagline">Real-time party word game · dictionary-validated</p>
 
@@ -745,6 +879,10 @@ input[type="text"]:disabled { opacity: 0.4; cursor: not-allowed; }
         Word must start with
         <strong id="mustStartLetter">—</strong>
       </div>
+    </div>
+
+    <div class="hard-mode-banner" id="hardModeBanner" style="display:none">
+      🔥 Hard mode — match the last 2 letters!
     </div>
 
     <div class="timer-wrap" id="timerWrap" style="display:none">
